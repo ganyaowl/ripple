@@ -27,6 +27,9 @@
     p { margin: 0 0 16px; color: #888; }
     label { display: flex; align-items: center; gap: 10px; }
     #panel { position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); z-index: 3; max-width: min(260px, 85vw); text-align: right; }
+    details { margin-top: 8px; color: #888; font-size: 11px; }
+    summary { cursor: pointer; min-height: 32px; padding-top: 8px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; text-align: left; }
     #status { color: #888; font-size: 11px; }
     #qr { display: block; margin: 12px 0 0 auto; border: 6px solid #fff; }
     #qr[hidden] { display: none; }
@@ -43,14 +46,17 @@
   </form>
   <aside id="panel">
     <button id="qr-button" aria-expanded="false">[ qr ]</button> <span>online: <span id="online">0</span></span>
-    <div><span id="status" role="status">connecting...</span> / r5</div>
+    <div><span id="status" role="status">connecting...</span> / r7</div>
+    <details><summary>[ network ]</summary><pre id="network" aria-live="polite"></pre></details>
     <img id="qr" width="150" height="150" alt="Scan to join ripple" hidden>
   </aside>
   <script type="module">
     const $ = id => document.getElementById(id);
     const canvas = $('ocean'), ctx = canvas.getContext('2d');
     const CELL = 12, CHARS = ' .:~+=xX#%@', STEP = 1000 / 60;
-    const swimmers = new Map(), peers = new Set();
+    const swimmers = new Map(), peers = new Set(), latest = new Map();
+    let sequence = 0, received = 0, rejected = 0, forwarded = 0, relaySockets, lastError = '';
+    const started = Date.now();
     const hue = Math.random() * 360;
     const color = [0, 8, 4].map(n => {
       const k = (n + hue / 30) % 12;
@@ -66,6 +72,7 @@
     const FONT = '"JetBrains Mono", monospace';
     const error = reason => {
       console.error(reason);
+      lastError = reason?.message || String(reason);
       $('status').textContent = `offline: ${reason.message || reason}`;
     };
     let cols, rows, current, previous, sendMove, selfId = '', dirty = false;
@@ -80,10 +87,14 @@
     addEventListener('resize', resize);
     resize();
 
-    const send = async target => {
-      if (!me.n || !sendMove) return;
-      try { await sendMove({ x: me.tx, y: me.ty, c: me.c, n: me.n }, target); }
+    const transmit = async (packet, target) => {
+      if (!sendMove) return;
+      try { await sendMove(packet, target); }
       catch (reason) { error(reason); }
+    };
+    const send = target => {
+      if (!me.n || !selfId || !sendMove) return;
+      transmit({ id: selfId, seq: ++sequence, ttl: 8, x: me.tx, y: me.ty, c: me.c, n: me.n }, target);
     };
     const count = () => {
       const used = new Set();
@@ -104,37 +115,71 @@
         if (!globalThis.crypto?.subtle) throw new Error('open this page over HTTPS');
         const api = await import('https://esm.sh/trystero@0.20.0/nostr');
         selfId = api.selfId;
+        relaySockets = api.getRelaySockets;
         count();
         const room = api.joinRoom(
           { appId: 'ascii-ocean-p2p-v1', relayRedundancy: 3 },
           'tuit-sysdesign-2026',
-          { onJoinError: reason => error(reason.error || reason) }
+          { onJoinError: reason => error(new Error(`join ${reason.peerId || '?'}: ${reason.error?.message || reason.error || 'failed'}`)) }
         );
         const [transmit, receive] = room.makeAction('move');
         sendMove = transmit;
         $('status').textContent = 'waiting for peers...';
-        room.onPeerJoin(id => { peers.add(id); count(); send(id); });
+        room.onPeerJoin(id => {
+          peers.add(id);
+          count();
+          send(id);
+          for (const { packet, seen } of latest.values()) {
+            if (Date.now() - seen < 8000 && packet.ttl > 0) transmit({ ...packet, ttl: packet.ttl - 1 }, id);
+          }
+        });
         room.onPeerLeave(id => {
           peers.delete(id);
-          swimmers.delete(id);
           count();
         });
-        receive((data, id) => {
-          if (!data || ![data.x, data.y].every(v => Number.isFinite(v) && v >= 0 && v <= 1) ||
+        receive((data, sender) => {
+          received++;
+          if (!data || typeof data.id !== 'string' || !data.id || data.id === 'local' || data.id.length > 128 ||
+              !Number.isSafeInteger(data.seq) || data.seq < 1 || !Number.isInteger(data.ttl) || data.ttl < 0 || data.ttl > 8 ||
+              ![data.x, data.y].every(v => Number.isFinite(v) && v >= 0 && v <= 1) ||
               typeof data.n !== 'string' || !data.n || data.n.length > 12 ||
               !Array.isArray(data.c) || data.c.length !== 3 ||
-              !data.c.every(v => Number.isFinite(v) && v >= 0)) return;
-          const swimmer = swimmers.get(id) || { x: data.x, y: data.y };
-          Object.assign(swimmer, { tx: data.x, ty: data.y, c: data.c.map(v => Math.min(1, v)), n: data.n });
-          swimmers.set(id, swimmer);
-          count();
+              !data.c.every(v => Number.isFinite(v) && v >= 0 && v <= 1)) { rejected++; return; }
+          if (data.id === selfId || data.seq <= (latest.get(data.id)?.packet.seq || 0)) return;
+          latest.set(data.id, { packet: data, seen: Date.now() });
+          const isNew = !swimmers.has(data.id);
+          const swimmer = swimmers.get(data.id) || { x: data.x, y: data.y };
+          Object.assign(swimmer, { tx: data.x, ty: data.y, c: data.c, n: data.n });
+          swimmers.set(data.id, swimmer);
+          if (isNew) count();
+          const targets = [...peers].filter(id => id !== sender && id !== data.id);
+          if (data.ttl && targets.length) {
+            forwarded++;
+            transmit({ ...data, ttl: data.ttl - 1 }, targets);
+          }
         });
         send();
       } catch (reason) { error(reason); }
     }
     connect();
     setInterval(() => { if (dirty) { dirty = false; send(); } }, 33);
-    setInterval(() => { if (peers.size) send(); }, 1000);
+    setInterval(() => {
+      if (peers.size) send();
+      for (const [id, state] of latest) {
+        const age = Date.now() - state.seen;
+        if (age > 8000 && swimmers.delete(id)) count();
+        if (age > 60000) latest.delete(id);
+      }
+      const sockets = Object.values(relaySockets?.() || {});
+      $('network').textContent = [
+        `build: r7 / uptime: ${Math.floor((Date.now() - started) / 1000)}s`,
+        `signaling: ${sockets.filter(socket => socket.readyState === 1).length}/${sockets.length} relays open`,
+        `direct peers: ${peers.size} / remote players: ${swimmers.size - Number(!!me.n)}`,
+        `messages: ${received} received / ${forwarded} forwarded / ${rejected} invalid`,
+        `last error: ${lastError || 'none'}`,
+        ...[...peers].map(id => `peer: ${id.slice(0, 12)}`)
+      ].join('\n');
+    }, 1000);
     addEventListener('pageshow', () => send());
     document.addEventListener('visibilitychange', () => { if (!document.hidden) send(); });
     $('login').onsubmit = event => {
@@ -181,10 +226,10 @@
         const ease = p === me ? .45 : .2;
         p.x += dx * ease;
         p.y += dy * ease;
-        disturb(p.x, p.y, p.c, (90 + Math.min(240, Math.hypot(dx, dy) * 7000)) * Math.sin(time / 140));
+        disturb(p.x, p.y, p.c, Math.min(160, Math.hypot(dx, dy) * 4800) + 24 * Math.sin(time / 240));
       }
       if (!me.n) {
-        disturb(.5 + .2 * Math.sin(time / 2300), .5 + .18 * Math.cos(time / 3100), color, 100 * Math.sin(time / 140));
+        disturb(.5 + .2 * Math.sin(time / 2300), .5 + .18 * Math.cos(time / 3100), color, 45 * Math.sin(time / 240));
       }
       const stride = cols * 3;
       for (let y = 1; y < rows - 1; y++) {
@@ -192,7 +237,7 @@
           const index = (y * cols + x) * 3;
           for (let c = 0; c < 3; c++) {
             const k = index + c;
-            current[k] = ((previous[k - 3] + previous[k + 3] + previous[k - stride] + previous[k + stride]) / 2 - current[k]) * .985;
+            current[k] = ((previous[k - 3] + previous[k + 3] + previous[k - stride] + previous[k + stride]) / 2 - current[k]) * .982;
           }
         }
       }
@@ -206,7 +251,7 @@
         for (let x = 1; x < cols - 1; x++) {
           const index = (y * cols + x) * 3;
           const r = Math.abs(previous[index]), g = Math.abs(previous[index + 1]), b = Math.abs(previous[index + 2]);
-          const amplitude = Math.min(1, (r + g + b) / 180);
+          const amplitude = Math.min(1, (r + g + b) / 230);
           if (amplitude < .012) continue;
           const scale = 255 * Math.sqrt(amplitude) / Math.max(r, g, b, 1);
           ctx.fillStyle = rgb(r * scale, g * scale, b * scale);
