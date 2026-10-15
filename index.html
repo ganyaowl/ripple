@@ -47,11 +47,11 @@
     const $ = id => document.getElementById(id);
     const canvas = $('ocean'), ctx = canvas.getContext('2d');
     const CELL = 12, CHARS = ' .:~+=xX#%@', STEP = 1000 / 60;
-    const swimmers = new Map();
+    const swimmers = new Map(), peers = new Set();
     const hue = Math.random() * 360;
     const color = [0, 8, 4].map(n => {
       const k = (n + hue / 30) % 12;
-      return Math.max(.15, .6 - .5 * Math.max(-1, Math.min(k - 3, 9 - k, 1)));
+      return Math.max(.15, .5 - .5 * Math.max(-1, Math.min(k - 3, 9 - k, 1)));
     });
     const me = { x: .5, y: .5, tx: .5, ty: .5, c: color, n: '' };
     const rgb = (r, g, b) => `rgb(${r | 0},${g | 0},${b | 0})`;
@@ -77,7 +77,12 @@
       try { await sendMove({ x: me.tx, y: me.ty, c: me.c, n: me.n }, target); }
       catch (reason) { error(reason); }
     };
-    const count = () => $('online').textContent = swimmers.size;
+    const count = () => {
+      $('online').textContent = swimmers.size;
+      $('status').textContent = peers.size
+        ? `peers: ${peers.size} / swimmers: ${[...swimmers.keys()].filter(id => id !== 'local').length}`
+        : 'waiting for peers...';
+    };
     async function connect() {
       try {
         if (!globalThis.crypto?.subtle) throw new Error('open this page over HTTPS');
@@ -87,11 +92,11 @@
         const [transmit, receive] = room.makeAction('move');
         sendMove = transmit;
         $('status').textContent = 'waiting for peers...';
-        room.onPeerJoin(id => { $('status').textContent = 'connected'; send(id); });
+        room.onPeerJoin(id => { peers.add(id); count(); send(id); });
         room.onPeerLeave(id => {
+          peers.delete(id);
           swimmers.delete(id);
           count();
-          if (!Object.keys(room.getPeers()).length) $('status').textContent = 'waiting for peers...';
         });
         receive((data, id) => {
           if (!data || ![data.x, data.y].every(v => Number.isFinite(v) && v >= 0 && v <= 1) ||
@@ -108,6 +113,9 @@
     }
     connect();
     setInterval(() => { if (dirty) { dirty = false; send(); } }, 33);
+    setInterval(() => { if (peers.size) send(); }, 1000);
+    addEventListener('pageshow', () => send());
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) send(); });
     $('login').onsubmit = event => {
       event.preventDefault();
       me.n = $('name').value.trim() || selfId.slice(0, 4) || 'guest';
