@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#060608">
+  <title>ripple</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    :root { font: 13px "JetBrains Mono", monospace; color: #ddd; background: #060608; }
+    html, body { margin: 0; width: 100%; height: 100%; }
+    body { overflow: hidden; }
+    canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+    button, input { font: inherit; color: inherit; background: transparent; border: 0; border-radius: 0; }
+    button { min-height: 44px; padding: 10px; cursor: pointer; }
+    button:hover { color: #fff; }
+    input { width: 16ch; padding: 10px 0; border-bottom: 1px solid #666; font-size: 16px; }
+    :focus-visible { outline: 1px dashed currentColor; outline-offset: 4px; }
+    #login { position: fixed; inset: 0; z-index: 2; display: grid; place-content: center; gap: 12px; text-align: center; background: #060608b0; }
+    [hidden], #login[hidden] { display: none; }
+    h1 { margin: 0; font: inherit; font-size: 24px; letter-spacing: 3px; }
+    p { margin: 0 0 16px; color: #888; }
+    label { display: flex; align-items: center; gap: 10px; }
+    #panel { position: fixed; top: max(8px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); z-index: 3; max-width: min(260px, 85vw); text-align: right; }
+    #status { color: #888; font-size: 11px; }
+    #qr { display: block; margin: 12px 0 0 auto; border: 6px solid #fff; }
+    #qr[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="ocean" aria-label="Shared ocean of colorful ASCII ripples"></canvas>
+  <form id="login">
+    <h1>ripple</h1>
+    <p>~</p>
+    <label>name: <input id="name" aria-label="Your name" placeholder="________" maxlength="12" autocomplete="nickname" enterkeyhint="go" spellcheck="false"></label>
+    <button>[ enter ]</button>
+  </form>
+  <aside id="panel">
+    <button id="qr-button" aria-expanded="false">[ qr ]</button> <span>online: <span id="online">0</span></span>
+    <div id="status" role="status">connecting...</div>
+    <img id="qr" width="150" height="150" alt="Scan to join ripple" hidden>
+  </aside>
+  <script type="module">
+    const $ = id => document.getElementById(id);
+    const canvas = $('ocean'), ctx = canvas.getContext('2d');
+    const CELL = 12, CHARS = ' .:~+=xX#%@', STEP = 1000 / 60;
+    const swimmers = new Map();
+    const hue = Math.random() * 360;
+    const color = [0, 8, 4].map(n => {
+      const k = (n + hue / 30) % 12;
+      return Math.max(.15, .6 - .5 * Math.max(-1, Math.min(k - 3, 9 - k, 1)));
+    });
+    const me = { x: .5, y: .5, tx: .5, ty: .5, c: color, n: '' };
+    const rgb = (r, g, b) => `rgb(${r | 0},${g | 0},${b | 0})`;
+    const FONT = '"JetBrains Mono", monospace';
+    const error = reason => {
+      console.error(reason);
+      $('status').textContent = `offline: ${reason.message || reason}`;
+    };
+    let cols, rows, current, previous, sendMove, selfId = '', dirty = false;
+    const resize = () => {
+      canvas.width = innerWidth;
+      canvas.height = innerHeight;
+      cols = Math.max(3, Math.ceil(innerWidth / CELL));
+      rows = Math.max(3, Math.ceil(innerHeight / CELL));
+      current = new Float32Array(cols * rows * 3);
+      previous = new Float32Array(current.length);
+    };
+    addEventListener('resize', resize);
+    resize();
+
+    const send = async target => {
+      if (!me.n || !sendMove) return;
+      try { await sendMove({ x: me.tx, y: me.ty, c: me.c, n: me.n }, target); }
+      catch (reason) { error(reason); }
+    };
+    const count = () => $('online').textContent = swimmers.size;
+    async function connect() {
+      try {
+        if (!globalThis.crypto?.subtle) throw new Error('open this page over HTTPS');
+        const api = await import('https://esm.sh/trystero@0.20.0/mqtt');
+        selfId = api.selfId;
+        const room = api.joinRoom({ appId: 'ascii-ocean-p2p-v1' }, 'tuit-sysdesign-2026');
+        const [transmit, receive] = room.makeAction('move');
+        sendMove = transmit;
+        $('status').textContent = 'waiting for peers...';
+        room.onPeerJoin(id => { $('status').textContent = 'connected'; send(id); });
+        room.onPeerLeave(id => {
+          swimmers.delete(id);
+          count();
+          if (!Object.keys(room.getPeers()).length) $('status').textContent = 'waiting for peers...';
+        });
+        receive((data, id) => {
+          if (!data || ![data.x, data.y].every(v => Number.isFinite(v) && v >= 0 && v <= 1) ||
+              typeof data.n !== 'string' || !data.n || data.n.length > 12 ||
+              !Array.isArray(data.c) || data.c.length !== 3 ||
+              !data.c.every(v => Number.isFinite(v) && v >= 0 && v <= 1)) return;
+          const swimmer = swimmers.get(id) || { x: data.x, y: data.y };
+          Object.assign(swimmer, { tx: data.x, ty: data.y, c: data.c, n: data.n });
+          swimmers.set(id, swimmer);
+          count();
+        });
+        send();
+      } catch (reason) { error(reason); }
+    }
+    connect();
+    setInterval(() => { if (dirty) { dirty = false; send(); } }, 33);
+    $('login').onsubmit = event => {
+      event.preventDefault();
+      me.n = $('name').value.trim() || selfId.slice(0, 4) || 'guest';
+      swimmers.set('local', me);
+      $('name').blur();
+      $('login').hidden = true;
+      count();
+      send();
+    };
+    canvas.onpointerdown = canvas.onpointermove = event => {
+      if (!me.n || !event.isPrimary) return;
+      if (event.type === 'pointerdown') canvas.setPointerCapture(event.pointerId);
+      me.tx = Math.max(0, Math.min(1, event.clientX / innerWidth));
+      me.ty = Math.max(0, Math.min(1, event.clientY / innerHeight));
+      dirty = true;
+      if (event.type === 'pointerdown') { dirty = false; send(); }
+    };
+    $('qr-button').onclick = () => {
+      const qr = $('qr');
+      if (!qr.src) qr.src = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(location.href)}`;
+      qr.hidden = !qr.hidden;
+      $('qr-button').setAttribute('aria-expanded', String(!qr.hidden));
+    };
+
+    function disturb(x, y, color, strength) {
+      const gx = Math.max(1, Math.min(cols - 2, Math.floor(x * cols)));
+      const gy = Math.max(1, Math.min(rows - 2, Math.floor(y * rows)));
+      const index = (gy * cols + gx) * 3;
+      for (let c = 0; c < 3; c++) previous[index + c] += color[c] * strength;
+    }
+    function step(time) {
+      for (const p of swimmers.values()) {
+        const dx = p.tx - p.x, dy = p.ty - p.y;
+        const ease = p === me ? .45 : .2;
+        p.x += dx * ease;
+        p.y += dy * ease;
+        disturb(p.x, p.y, p.c, 140 * (Math.min(1.5, Math.hypot(dx, dy) * 25) + .3 * Math.sin(time / 180)));
+      }
+      if (!me.n) {
+        disturb(.5 + .2 * Math.sin(time / 2300), .5 + .18 * Math.cos(time / 3100), color, 80 * Math.sin(time / 180));
+      }
+      const stride = cols * 3;
+      for (let y = 1; y < rows - 1; y++) {
+        for (let x = 1; x < cols - 1; x++) {
+          const index = (y * cols + x) * 3;
+          for (let c = 0; c < 3; c++) {
+            const k = index + c;
+            current[k] = ((previous[k - 3] + previous[k + 3] + previous[k - stride] + previous[k + stride]) / 2 - current[k]) * .975;
+          }
+        }
+      }
+      [previous, current] = [current, previous];
+    }
+    function draw() {
+      ctx.fillStyle = '#060608';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.font = `${CELL}px ${FONT}`;
+      for (let y = 1; y < rows - 1; y++) {
+        for (let x = 1; x < cols - 1; x++) {
+          const index = (y * cols + x) * 3;
+          const r = Math.abs(previous[index]), g = Math.abs(previous[index + 1]), b = Math.abs(previous[index + 2]);
+          const amplitude = Math.min(1, (r + g + b) / 260);
+          if (amplitude < .025) continue;
+          const scale = 255 * Math.sqrt(amplitude) / Math.max(r, g, b, 1);
+          ctx.fillStyle = rgb(r * scale, g * scale, b * scale);
+          ctx.fillText(CHARS[Math.floor(amplitude * (CHARS.length - 1))], x * CELL, y * CELL);
+        }
+      }
+      ctx.font = `12px ${FONT}`;
+      for (const p of swimmers.values()) {
+        const x = p.x * canvas.width, y = p.y * canvas.height;
+        ctx.fillStyle = rgb(...p.c.map(v => v * 255));
+        ctx.fillText('~', x - 4, y + 4);
+        const width = ctx.measureText(p.n).width;
+        const labelX = Math.max(6, Math.min(canvas.width - width - 6, x + 12));
+        const labelY = Math.max(16, Math.min(canvas.height - 6, y - 10));
+        ctx.fillText(p.n, labelX, labelY);
+      }
+    }
+    let last = 0, elapsed = 0, time = 0;
+    function frame(now) {
+      elapsed += Math.min(now - (last || now), STEP * 2);
+      last = now;
+      while (elapsed >= STEP) { time += STEP; step(time); elapsed -= STEP; }
+      draw();
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
