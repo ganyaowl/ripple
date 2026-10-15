@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#060608">
   <title>ripple</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -46,7 +47,7 @@
   </form>
   <aside id="panel">
     <button id="qr-button" aria-expanded="false">[ qr ]</button> <span>online: <span id="online">0</span></span>
-    <div><span id="status" role="status">connecting...</span> / r7</div>
+    <div><span id="status" role="status">connecting...</span> / r9</div>
     <details><summary>[ network ]</summary><pre id="network" aria-live="polite"></pre></details>
     <img id="qr" width="150" height="150" alt="Scan to join ripple" hidden>
   </aside>
@@ -57,6 +58,20 @@
     const swimmers = new Map(), peers = new Set(), latest = new Map();
     let sequence = 0, received = 0, rejected = 0, forwarded = 0, relaySockets, lastError = '';
     const started = Date.now();
+    const algorithm = { name: 'ECDSA', namedCurve: 'P-256', hash: 'SHA-256' };
+    const encode = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes))).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    const decode = text => Uint8Array.from(atob(text.replaceAll('-', '+').replaceAll('_', '/')), char => char.charCodeAt(0));
+    const bytes = text => new TextEncoder().encode(text);
+    const checking = new Set();
+    let identity, signing = false, lastSent = 0, tokens = 1500, tokenTime = performance.now();
+    const admit = () => {
+      const now = performance.now();
+      tokens = Math.min(1500, tokens + (now - tokenTime) * 1.5);
+      tokenTime = now;
+      if (tokens < 1) return false;
+      tokens--;
+      return true;
+    };
     const hue = Math.random() * 360;
     const color = [0, 8, 4].map(n => {
       const k = (n + hue / 30) % 12;
@@ -92,9 +107,17 @@
       try { await sendMove(packet, target); }
       catch (reason) { error(reason); }
     };
-    const send = target => {
-      if (!me.n || !selfId || !sendMove) return;
-      transmit({ id: selfId, seq: ++sequence, ttl: 8, x: me.tx, y: me.ty, c: me.c, n: me.n }, target);
+    const send = async target => {
+      if (!me.n || !identity || !sendMove) return;
+      if (signing || performance.now() - lastSent < 33) { dirty = true; return; }
+      signing = true;
+      lastSent = performance.now();
+      try {
+        const body = JSON.stringify({ id: selfId, seq: ++sequence, time: Date.now(), x: me.tx, y: me.ty, c: me.c, n: me.n });
+        const sig = encode(await crypto.subtle.sign(algorithm, identity.privateKey, bytes(body)));
+        await transmit({ body, sig, ttl: 8 }, target);
+      } catch (reason) { error(reason); }
+      finally { signing = false; }
     };
     const count = () => {
       const used = new Set();
@@ -113,8 +136,9 @@
     async function connect() {
       try {
         if (!globalThis.crypto?.subtle) throw new Error('open this page over HTTPS');
+        identity = await crypto.subtle.generateKey(algorithm, false, ['sign', 'verify']);
+        selfId = encode(await crypto.subtle.exportKey('raw', identity.publicKey));
         const api = await import('https://esm.sh/trystero@0.20.0/nostr');
-        selfId = api.selfId;
         relaySockets = api.getRelaySockets;
         count();
         const room = api.joinRoom(
@@ -122,8 +146,8 @@
           'tuit-sysdesign-2026',
           { onJoinError: reason => error(new Error(`join ${reason.peerId || '?'}: ${reason.error?.message || reason.error || 'failed'}`)) }
         );
-        const [transmit, receive] = room.makeAction('move');
-        sendMove = transmit;
+        const [deliver, receive] = room.makeAction('signed-move');
+        sendMove = deliver;
         $('status').textContent = 'waiting for peers...';
         room.onPeerJoin(id => {
           peers.add(id);
@@ -137,26 +161,44 @@
           peers.delete(id);
           count();
         });
-        receive((data, sender) => {
+        receive(async (packet, sender) => {
           received++;
-          if (!data || typeof data.id !== 'string' || !data.id || data.id === 'local' || data.id.length > 128 ||
-              !Number.isSafeInteger(data.seq) || data.seq < 1 || !Number.isInteger(data.ttl) || data.ttl < 0 || data.ttl > 8 ||
-              ![data.x, data.y].every(v => Number.isFinite(v) && v >= 0 && v <= 1) ||
-              typeof data.n !== 'string' || !data.n || data.n.length > 12 ||
-              !Array.isArray(data.c) || data.c.length !== 3 ||
-              !data.c.every(v => Number.isFinite(v) && v >= 0 && v <= 1)) { rejected++; return; }
-          if (data.id === selfId || data.seq <= (latest.get(data.id)?.packet.seq || 0)) return;
-          latest.set(data.id, { packet: data, seen: Date.now() });
-          const isNew = !swimmers.has(data.id);
-          const swimmer = swimmers.get(data.id) || { x: data.x, y: data.y };
-          Object.assign(swimmer, { tx: data.x, ty: data.y, c: data.c, n: data.n });
-          swimmers.set(data.id, swimmer);
-          if (isNew) count();
-          const targets = [...peers].filter(id => id !== sender && id !== data.id);
-          if (data.ttl && targets.length) {
-            forwarded++;
-            transmit({ ...data, ttl: data.ttl - 1 }, targets);
-          }
+          if (!admit()) { rejected++; return; }
+          let id, locked = false;
+          try {
+            if (!packet || Object.keys(packet).length !== 3 || typeof packet.body !== 'string' || packet.body.length > 512 ||
+                typeof packet.sig !== 'string' || !/^[A-Za-z0-9_-]{86}$/.test(packet.sig) ||
+                !Number.isInteger(packet.ttl) || packet.ttl < 0 || packet.ttl > 8) throw new Error();
+            const data = JSON.parse(packet.body);
+            if (!data || Object.keys(data).length !== 7 || typeof data.id !== 'string' || !/^[A-Za-z0-9_-]{87}$/.test(data.id) ||
+                !Number.isSafeInteger(data.seq) || data.seq < 1 || !Number.isSafeInteger(data.time) || Math.abs(Date.now() - data.time) > 120000 ||
+                ![data.x, data.y].every(v => Number.isFinite(v) && v >= 0 && v <= 1) ||
+                typeof data.n !== 'string' || !data.n.trim() || data.n.length > 12 || /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(data.n) ||
+                !Array.isArray(data.c) || data.c.length !== 3 ||
+                !data.c.every(v => Number.isFinite(v) && v >= 0 && v <= 1)) throw new Error();
+            id = data.id;
+            const known = latest.get(id);
+            if (id === selfId || data.seq <= (known?.seq || 0)) return;
+            if (known && Date.now() - known.seen < 20) return;
+            if ((!known && latest.size >= 96) || checking.size >= 8 || checking.has(id)) { rejected++; return; }
+            checking.add(id);
+            locked = true;
+            const key = known?.key || await crypto.subtle.importKey('raw', decode(id), algorithm, false, ['verify']);
+            if (!await crypto.subtle.verify(algorithm, key, decode(packet.sig), bytes(packet.body))) throw new Error();
+            if (data.seq <= (latest.get(id)?.seq || 0) || (!latest.has(id) && latest.size >= 96)) return;
+            latest.set(id, { packet, seq: data.seq, key, seen: Date.now() });
+            const isNew = !swimmers.has(id);
+            const swimmer = swimmers.get(id) || { x: data.x, y: data.y };
+            Object.assign(swimmer, { tx: data.x, ty: data.y, c: data.c, n: data.n });
+            swimmers.set(id, swimmer);
+            if (isNew) count();
+            const targets = [...peers].filter(id => id !== sender);
+            if (packet.ttl && targets.length) {
+              forwarded++;
+              transmit({ body: packet.body, sig: packet.sig, ttl: packet.ttl - 1 }, targets);
+            }
+          } catch { rejected++; }
+          finally { if (locked) checking.delete(id); }
         });
         send();
       } catch (reason) { error(reason); }
@@ -168,11 +210,11 @@
       for (const [id, state] of latest) {
         const age = Date.now() - state.seen;
         if (age > 8000 && swimmers.delete(id)) count();
-        if (age > 60000) latest.delete(id);
+        if (age > 300000) latest.delete(id);
       }
       const sockets = Object.values(relaySockets?.() || {});
       $('network').textContent = [
-        `build: r7 / uptime: ${Math.floor((Date.now() - started) / 1000)}s`,
+        `build: r9 / uptime: ${Math.floor((Date.now() - started) / 1000)}s`,
         `signaling: ${sockets.filter(socket => socket.readyState === 1).length}/${sockets.length} relays open`,
         `direct peers: ${peers.size} / remote players: ${swimmers.size - Number(!!me.n)}`,
         `messages: ${received} received / ${forwarded} forwarded / ${rejected} invalid`,
@@ -184,7 +226,7 @@
     document.addEventListener('visibilitychange', () => { if (!document.hidden) send(); });
     $('login').onsubmit = event => {
       event.preventDefault();
-      me.n = $('name').value.trim() || selfId.slice(0, 4) || 'guest';
+      me.n = $('name').value.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, '').trim().slice(0, 12) || 'guest';
       swimmers.set('local', me);
       $('name').blur();
       $('panel').prepend($('color-label'));
@@ -202,7 +244,7 @@
     };
     $('qr-button').onclick = () => {
       const qr = $('qr');
-      if (!qr.src) qr.src = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(location.href)}`;
+      if (!qr.src) qr.src = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(location.origin + location.pathname)}`;
       qr.hidden = !qr.hidden;
       $('qr-button').setAttribute('aria-expanded', String(!qr.hidden));
     };
@@ -220,27 +262,33 @@
         }
       }
     }
+    let waveGain = 1, waveEnergy = 0;
     function step(time) {
+      const targetGain = 1 / Math.sqrt(Math.max(1, swimmers.size) * (1 + waveEnergy / 6400));
+      waveGain += (targetGain - waveGain) * .025;
       for (const p of swimmers.values()) {
         const dx = p.tx - p.x, dy = p.ty - p.y;
         const ease = p === me ? .45 : .2;
         p.x += dx * ease;
         p.y += dy * ease;
-        disturb(p.x, p.y, p.c, Math.min(160, Math.hypot(dx, dy) * 4800) + 24 * Math.sin(time / 240));
+        disturb(p.x, p.y, p.c, waveGain * (Math.min(160, Math.hypot(dx, dy) * 4800) + 24 * Math.sin(time / 240)));
       }
       if (!me.n) {
         disturb(.5 + .2 * Math.sin(time / 2300), .5 + .18 * Math.cos(time / 3100), color, 45 * Math.sin(time / 240));
       }
       const stride = cols * 3;
+      let energy = 0;
       for (let y = 1; y < rows - 1; y++) {
         for (let x = 1; x < cols - 1; x++) {
           const index = (y * cols + x) * 3;
           for (let c = 0; c < 3; c++) {
             const k = index + c;
             current[k] = ((previous[k - 3] + previous[k + 3] + previous[k - stride] + previous[k + stride]) / 2 - current[k]) * .982;
+            energy += current[k] * current[k];
           }
         }
       }
+      waveEnergy = energy / current.length;
       [previous, current] = [current, previous];
     }
     function draw() {
@@ -251,7 +299,8 @@
         for (let x = 1; x < cols - 1; x++) {
           const index = (y * cols + x) * 3;
           const r = Math.abs(previous[index]), g = Math.abs(previous[index + 1]), b = Math.abs(previous[index + 2]);
-          const amplitude = Math.min(1, (r + g + b) / 230);
+          const level = (r + g + b) / 230;
+          const amplitude = level <= .55 ? level : .55 + .45 * (level - .55) / (level - .1);
           if (amplitude < .012) continue;
           const scale = 255 * Math.sqrt(amplitude) / Math.max(r, g, b, 1);
           ctx.fillStyle = rgb(r * scale, g * scale, b * scale);
