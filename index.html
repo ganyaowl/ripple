@@ -37,17 +37,17 @@
   </style>
 </head>
 <body>
-  <canvas id="ocean" aria-label="Shared ocean of colorful ASCII ripples"></canvas>
+  <canvas id="ocean" aria-label="Shared field of flowing ASCII colors"></canvas>
   <form id="login">
     <h1>ripple</h1>
     <p>~</p>
     <label>name: <input id="name" aria-label="Your name" placeholder="________" maxlength="12" autocomplete="nickname" enterkeyhint="go" spellcheck="false"></label>
-    <label id="color-label">color: <input id="color" type="color" aria-label="Your wave color"></label>
+    <label id="color-label">color: <input id="color" type="color" aria-label="Your color"></label>
     <button>[ enter ]</button>
   </form>
   <aside id="panel">
     <button id="qr-button" aria-expanded="false">[ qr ]</button> <span>online: <span id="online">0</span></span>
-    <div><span id="status" role="status">connecting...</span> / r9</div>
+    <div><span id="status" role="status">connecting...</span> / r10</div>
     <details><summary>[ network ]</summary><pre id="network" aria-live="polite"></pre></details>
     <img id="qr" width="150" height="150" alt="Scan to join ripple" hidden>
   </aside>
@@ -90,14 +90,15 @@
       lastError = reason?.message || String(reason);
       $('status').textContent = `offline: ${reason.message || reason}`;
     };
-    let cols, rows, current, previous, sendMove, selfId = '', dirty = false;
+    let cols, rows, current, previous, drift, sendMove, selfId = '', dirty = false;
     const resize = () => {
       canvas.width = innerWidth;
       canvas.height = innerHeight;
       cols = Math.max(3, Math.ceil(innerWidth / CELL));
       rows = Math.max(3, Math.ceil(innerHeight / CELL));
-      current = new Float32Array(cols * rows * 3);
+      current = new Float32Array(cols * rows * 5);
       previous = new Float32Array(current.length);
+      drift = new Float32Array(cols);
     };
     addEventListener('resize', resize);
     resize();
@@ -214,7 +215,7 @@
       }
       const sockets = Object.values(relaySockets?.() || {});
       $('network').textContent = [
-        `build: r9 / uptime: ${Math.floor((Date.now() - started) / 1000)}s`,
+        `build: r10 / uptime: ${Math.floor((Date.now() - started) / 1000)}s`,
         `signaling: ${sockets.filter(socket => socket.readyState === 1).length}/${sockets.length} relays open`,
         `direct peers: ${peers.size} / remote players: ${swimmers.size - Number(!!me.n)}`,
         `messages: ${received} received / ${forwarded} forwarded / ${rejected} invalid`,
@@ -249,46 +250,58 @@
       $('qr-button').setAttribute('aria-expanded', String(!qr.hidden));
     };
 
-    function disturb(x, y, color, strength) {
-      const gx = Math.max(1, Math.min(cols - 2, Math.floor(x * cols)));
-      const gy = Math.max(1, Math.min(rows - 2, Math.floor(y * rows)));
-      for (let oy = -1; oy <= 1; oy++) {
-        for (let ox = -1; ox <= 1; ox++) {
-          const x = gx + ox, y = gy + oy;
-          if (x < 1 || x >= cols - 1 || y < 1 || y >= rows - 1) continue;
-          const index = (y * cols + x) * 3;
-          const weight = 1 / (1 + 2 * (ox * ox + oy * oy));
-          for (let c = 0; c < 3; c++) previous[index + c] += color[c] * strength * weight;
+    function stir(x, y, color, strength, vx = 0, vy = 0) {
+      const gx = x * (cols - 1), gy = y * (rows - 1);
+      for (let oy = -4; oy <= 4; oy++) {
+        for (let ox = -4; ox <= 4; ox++) {
+          const px = Math.floor(gx) + ox, py = Math.floor(gy) + oy;
+          if (px < 1 || px >= cols - 1 || py < 1 || py >= rows - 1) continue;
+          const weight = Math.exp(-(ox * ox + oy * oy) / 7) * strength;
+          const index = (py * cols + px) * 5;
+          for (let c = 0; c < 3; c++) previous[index + c] += (color[c] - previous[index + c]) * weight;
+          previous[index + 3] = Math.max(-1, Math.min(1, previous[index + 3] + vx * weight));
+          previous[index + 4] = Math.max(-1, Math.min(1, previous[index + 4] + vy * weight));
         }
       }
     }
-    let waveGain = 1, waveEnergy = 0;
+    let pigmentGain = 1;
     function step(time) {
-      const targetGain = 1 / Math.sqrt(Math.max(1, swimmers.size) * (1 + waveEnergy / 6400));
-      waveGain += (targetGain - waveGain) * .025;
+      pigmentGain += (1 / Math.sqrt(Math.max(1, swimmers.size)) - pigmentGain) * .025;
       for (const p of swimmers.values()) {
-        const dx = p.tx - p.x, dy = p.ty - p.y;
+        const oldX = p.x, oldY = p.y;
         const ease = p === me ? .45 : .2;
-        p.x += dx * ease;
-        p.y += dy * ease;
-        disturb(p.x, p.y, p.c, waveGain * (Math.min(160, Math.hypot(dx, dy) * 4800) + 24 * Math.sin(time / 240)));
+        p.x += (p.tx - p.x) * ease;
+        p.y += (p.ty - p.y) * ease;
+        const vx = (p.x - oldX) * cols, vy = (p.y - oldY) * rows;
+        const speed = Math.hypot(vx, vy);
+        const steps = Math.min(8, Math.max(1, Math.ceil(speed / 2)));
+        const strength = pigmentGain * (.025 + Math.min(.16, speed * .08)) * (.95 + .05 * Math.sin(time / 1400));
+        for (let i = 1; i <= steps; i++) {
+          stir(oldX + (p.x - oldX) * i / steps, oldY + (p.y - oldY) * i / steps, p.c, strength / steps, vx, vy);
+        }
       }
-      if (!me.n) {
-        disturb(.5 + .2 * Math.sin(time / 2300), .5 + .18 * Math.cos(time / 3100), color, 45 * Math.sin(time / 240));
-      }
-      const stride = cols * 3;
-      let energy = 0;
+      if (!me.n) stir(.5 + .18 * Math.sin(time / 4500), .5 + .16 * Math.cos(time / 5800), color, .07, .12 * Math.cos(time / 4500), -.12 * Math.sin(time / 5800));
+      const stride = cols * 5;
+      for (let x = 1; x < cols - 1; x++) drift[x] = .025 * Math.cos(x * .13 + time / 6000);
       for (let y = 1; y < rows - 1; y++) {
+        const flow = .025 * Math.sin(y * .13 + time / 5000);
         for (let x = 1; x < cols - 1; x++) {
-          const index = (y * cols + x) * 3;
-          for (let c = 0; c < 3; c++) {
-            const k = index + c;
-            current[k] = ((previous[k - 3] + previous[k + 3] + previous[k - stride] + previous[k + stride]) / 2 - current[k]) * .982;
-            energy += current[k] * current[k];
+          const index = (y * cols + x) * 5;
+          const sx = Math.max(0, Math.min(cols - 1.001, x - previous[index + 3] - flow));
+          const sy = Math.max(0, Math.min(rows - 1.001, y - previous[index + 4] - drift[x]));
+          const base = (Math.floor(sy) * cols + Math.floor(sx)) * 5;
+          const fx = sx % 1, fy = sy % 1;
+          const edge = Math.min(1, Math.min(x, y, cols - 1 - x, rows - 1 - y) / 4);
+          for (let c = 0; c < 5; c++) {
+            const k = index + c, b = base + c;
+            const advected = (previous[b] * (1 - fx) + previous[b + 5] * fx) * (1 - fy)
+              + (previous[b + stride] * (1 - fx) + previous[b + stride + 5] * fx) * fy;
+            const neighbors = (previous[k - 5] + previous[k + 5] + previous[k - stride] + previous[k + stride]) / 4;
+            const viscosity = c < 3 ? .08 : .22;
+            current[k] = (advected * (1 - viscosity) + neighbors * viscosity) * (c < 3 ? .997 : .985) * (.85 + .15 * edge);
           }
         }
       }
-      waveEnergy = energy / current.length;
       [previous, current] = [current, previous];
     }
     function draw() {
@@ -297,12 +310,12 @@
       ctx.font = `${CELL}px ${FONT}`;
       for (let y = 1; y < rows - 1; y++) {
         for (let x = 1; x < cols - 1; x++) {
-          const index = (y * cols + x) * 3;
-          const r = Math.abs(previous[index]), g = Math.abs(previous[index + 1]), b = Math.abs(previous[index + 2]);
-          const level = (r + g + b) / 230;
+          const index = (y * cols + x) * 5;
+          const r = previous[index], g = previous[index + 1], b = previous[index + 2];
+          const level = (r + g + b) / 1.8;
           const amplitude = level <= .55 ? level : .55 + .45 * (level - .55) / (level - .1);
           if (amplitude < .012) continue;
-          const scale = 255 * Math.sqrt(amplitude) / Math.max(r, g, b, 1);
+          const scale = 255 * Math.sqrt(amplitude) / Math.max(r, g, b, .001);
           ctx.fillStyle = rgb(r * scale, g * scale, b * scale);
           ctx.fillText(CHARS[Math.max(1, Math.floor(Math.sqrt(amplitude) * (CHARS.length - 1)))], x * CELL, y * CELL);
         }
